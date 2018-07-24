@@ -8,6 +8,8 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
+use std::ops::RangeFrom;
+
 use rusqlite;
 
 use errors::{
@@ -51,46 +53,41 @@ use watcher::{
     NullWatcher,
 };
 
-pub static MAIN_TIMELINE: Entid = 0;
-
-fn ensure_on_tail_of(conn: &rusqlite::Connection, sorted_tx_ids: &[Entid], timeline: Entid) -> Result<()> {
-    let mut stmt = conn.prepare("SELECT tx, timeline FROM timelined_transactions WHERE tx >= ? AND timeline = ?")?;
-    let mut rows = stmt.query_and_then(&[&sorted_tx_ids[0], &timeline], |row: &rusqlite::Row| -> Result<(Entid, Entid)>{
+/// Collects a supplied tx range into an DESC ordered Vec of valid txs,
+/// ensuring they all belong to the same timeline.
+fn collect_ordered_txs_to_move(conn: &rusqlite::Connection, txs_from: RangeFrom<Entid>, timeline: Entid) -> Result<Vec<Entid>> {
+    let mut stmt = conn.prepare("SELECT tx, timeline FROM timelined_transactions WHERE tx >= ? AND timeline = ? GROUP BY tx ORDER BY tx DESC")?;
+    let mut rows = stmt.query_and_then(&[&txs_from.start, &timeline], |row: &rusqlite::Row| -> Result<(Entid, Entid)>{
         Ok((row.get_checked(0)?, row.get_checked(1)?))
     })?;
 
-    // Ensure that tx_ids are a consistent block at the tail end of the transactions table.
-    // TODO do this in SQL? e.g. SELECT tx FROM timelined_transactions WHERE tx >= ? AND tx NOT IN [tx_ids]...
+    let mut txs = vec![];
+
+    // TODO do this in SQL instead?
     let timeline = match rows.next() {
         Some(t) => {
             let t = t?;
-            if !sorted_tx_ids.contains(&t.0) {
-                println!("1) got tx: {}, list of txs: {:?}", t.0, sorted_tx_ids);
-                bail!(DbErrorKind::TimelinesNotOnTail);
-            }
+            txs.push(t.0);
             t.1
         },
-        None => bail!(DbErrorKind::TimelinesInvalidTransactionIds)
+        None => bail!(DbErrorKind::TimelinesInvalidRange)
     };
 
     while let Some(t) = rows.next() {
         let t = t?;
-        if !sorted_tx_ids.contains(&t.0) {
-            println!("2) got tx: {}, list of txs: {:?}", t.0, sorted_tx_ids);
-            bail!(DbErrorKind::TimelinesNotOnTail);
-        }
+        txs.push(t.0);
         if t.1 != timeline {
             bail!(DbErrorKind::TimelinesMixed);
         }
     }
 
-    Ok(())
+    Ok(txs)
 }
 
 fn move_transactions_to(conn: &rusqlite::Connection, tx_ids: &[Entid], new_timeline: Entid) -> Result<()> {
     // Move specified transactions over to a specified timeline.
     conn.execute(&format!(
-        "UPDATE timelined_transactions SET timeline = {} WHERE tx IN ({})",
+        "UPDATE timelined_transactions SET timeline = {} WHERE tx IN {}",
             new_timeline,
             ::repeat_values(tx_ids.len(), 1)
         ), &(tx_ids.iter().map(|x| x as &rusqlite::types::ToSql).collect::<Vec<_>>())
@@ -101,7 +98,7 @@ fn move_transactions_to(conn: &rusqlite::Connection, tx_ids: &[Entid], new_timel
 /// Get terms for tx_id, reversing them in meaning (swap add & retract).
 fn reversed_terms_for(conn: &rusqlite::Connection, tx_id: Entid) -> Result<Vec<TermWithoutTempIds>> {
     let mut stmt = conn.prepare("SELECT e, a, v, value_type_tag, tx, added FROM timelined_transactions WHERE tx = ? AND timeline = ? ORDER BY tx DESC")?;
-    let mut rows = stmt.query_and_then(&[&tx_id, &MAIN_TIMELINE], |row| -> Result<TermWithoutTempIds> {
+    let mut rows = stmt.query_and_then(&[&tx_id, &::TIMELINE_MAIN], |row| -> Result<TermWithoutTempIds> {
         let op = match row.get_checked(5)? {
             true => OpType::Retract,
             false => OpType::Add
@@ -122,26 +119,19 @@ fn reversed_terms_for(conn: &rusqlite::Connection, tx_id: Entid) -> Result<Vec<T
     Ok(terms)
 }
 
-/// Move specified tail-end transactions off of main timeline.
-/// 
-/// It's not possible to determine a high water-mark of partitions
-/// when rewinding transactions just by inspection of their datoms.
-/// We depend on our caller to supply the correct "target" partition map.
+/// Move specified transaction RangeFrom off of main timeline.
 pub fn move_from_main_timeline(conn: &rusqlite::Connection, schema: &Schema,
-    partition_map: PartitionMap, tx_ids: &[Entid], new_timeline: Entid) -> Result<(Option<Schema>, PartitionMap)> {
+    partition_map: PartitionMap, txs_from: RangeFrom<Entid>, new_timeline: Entid) -> Result<(Option<Schema>, PartitionMap)> {
 
-    if new_timeline == MAIN_TIMELINE {
+    if new_timeline == ::TIMELINE_MAIN {
         bail!(DbErrorKind::NotYetImplemented(format!("Can't move transactions to main timeline")));
     }
 
-    let mut sorted_tx_ids = tx_ids.to_vec();
-    sorted_tx_ids.sort_by(|t1, t2| t1.cmp(t2));
-
-    ensure_on_tail_of(conn, &sorted_tx_ids, MAIN_TIMELINE)?;
+    let txs_to_move = collect_ordered_txs_to_move(conn, txs_from, ::TIMELINE_MAIN)?;
 
     let mut last_schema = None;
-    for tx_id in sorted_tx_ids {
-        let reversed_terms = reversed_terms_for(conn, tx_id)?;
+    for tx_id in &txs_to_move {
+        let reversed_terms = reversed_terms_for(conn, *tx_id)?;
 
         // Rewind schema and datoms.
         let (_, _, new_schema, _) = transact_terms_with_action(
@@ -153,7 +143,7 @@ pub fn move_from_main_timeline(conn: &rusqlite::Connection, schema: &Schema,
     }
 
     // Move transactions over to the target timeline.
-    move_transactions_to(conn, tx_ids, new_timeline)?;
+    move_transactions_to(conn, &txs_to_move, new_timeline)?;
 
     Ok((last_schema, db::read_partition_map(conn)?))
 }
@@ -174,8 +164,8 @@ mod tests {
 
     use bootstrap;
 
-    // TODO I don't think "moving timelines" belongs in a conn (which would handle this),
-    // but perhaps it does?
+    // For convenience during testing.
+    // Real consumers will perform similar operations when appropriate.
     fn update_conn(conn: &mut TestConn, schema: &Option<Schema>, pmap: &PartitionMap) {
         match schema {
             Some(s) => conn.schema = s.clone(),
@@ -200,7 +190,7 @@ mod tests {
 
         let (new_schema, new_partition_map) = move_from_main_timeline(
             &conn.sqlite, &conn.schema, conn.partition_map.clone(),
-            &vec![conn.last_tx_id()], 1
+            conn.last_tx_id().., 1
         ).expect("moved single tx");
         update_conn(&mut conn, &new_schema, &new_partition_map);
 
@@ -242,7 +232,7 @@ mod tests {
 
         let (new_schema, new_partition_map) = move_from_main_timeline(
             &conn.sqlite, &conn.schema, conn.partition_map.clone(),
-            &vec![conn.last_tx_id()], 1
+            conn.last_tx_id().., 1
         ).expect("moved single tx");
         update_conn(&mut conn, &new_schema, &new_partition_map);
 
@@ -290,7 +280,7 @@ mod tests {
 
         let (new_schema, new_partition_map) = move_from_main_timeline(
             &conn.sqlite, &conn.schema, conn.partition_map.clone(),
-            &vec![report1.tx_id], 1).expect("moved single tx");
+            report1.tx_id.., 1).expect("moved single tx");
         update_conn(&mut conn, &new_schema, &new_partition_map);
 
         assert_matches!(conn.datoms(), "[]");
@@ -410,7 +400,7 @@ mod tests {
 
         let (new_schema, new_partition_map) = move_from_main_timeline(
             &conn.sqlite, &conn.schema, conn.partition_map.clone(),
-            &vec![tx_report2.tx_id], 1).expect("moved timeline");
+            tx_report2.tx_id.., 1).expect("moved timeline");
         update_conn(&mut conn, &new_schema, &new_partition_map);
 
         assert_matches!(conn.datoms(), second);
@@ -422,7 +412,7 @@ mod tests {
 
         let (new_schema, new_partition_map) = move_from_main_timeline(
             &conn.sqlite, &conn.schema, conn.partition_map.clone(),
-            &vec![tx_report1.tx_id], 1).expect("moved timeline");
+            tx_report1.tx_id.., 1).expect("moved timeline");
         update_conn(&mut conn, &new_schema, &new_partition_map);
         assert_matches!(conn.datoms(), first);
         assert_eq!(None, new_schema);
@@ -431,7 +421,49 @@ mod tests {
 
         let (new_schema, new_partition_map) = move_from_main_timeline(
             &conn.sqlite, &conn.schema, conn.partition_map.clone(),
-            &vec![tx_report0.tx_id], 1).expect("moved timeline");
+            tx_report0.tx_id.., 1).expect("moved timeline");
+        update_conn(&mut conn, &new_schema, &new_partition_map);
+        assert_eq!(true, new_schema.is_some());
+        assert_eq!(bootstrap::bootstrap_schema(), conn.schema);
+        assert_eq!(partition_map_after_bootstrap, conn.partition_map);
+        assert_matches!(conn.datoms(), "[]");
+        assert_matches!(conn.transactions(), "[]");
+    }
+
+    #[test]
+    fn test_move_range() {
+        let mut conn = TestConn::default();
+        conn.sanitized_partition_map();
+
+        let partition_map_after_bootstrap = conn.partition_map.clone();
+
+        assert_eq!((65536..65539),
+                   conn.partition_map.allocate_entids(":db.part/user", 3));
+        let tx_report0 = assert_transact!(conn, r#"[
+            {:db/id 65536 :db/ident :test/one :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+            {:db/id 65537 :db/ident :test/many :db/valueType :db.type/long :db/cardinality :db.cardinality/many}
+        ]"#);
+
+        assert_transact!(conn, r#"[
+            [:db/add 65538 :test/one 1]
+            [:db/add 65538 :test/many 2]
+            [:db/add 65538 :test/many 3]
+        ]"#);
+
+        assert_transact!(conn, r#"[
+            [:db/add 65538 :test/one 2]
+            [:db/add 65538 :test/many 2]
+            [:db/retract 65538 :test/many 3]
+            [:db/add 65538 :test/many 4]
+        ]"#);
+
+        // Remove all of these transactions from the main timeline,
+        // ensure we get back to a "just bootstrapped" state.
+        let (new_schema, new_partition_map) = move_from_main_timeline(
+            &conn.sqlite, &conn.schema, conn.partition_map.clone(),
+            tx_report0.tx_id.., 1).expect("moved timeline");
+        update_conn(&mut conn, &new_schema, &new_partition_map);
+
         update_conn(&mut conn, &new_schema, &new_partition_map);
         assert_eq!(true, new_schema.is_some());
         assert_eq!(bootstrap::bootstrap_schema(), conn.schema);
